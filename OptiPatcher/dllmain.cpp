@@ -5,16 +5,22 @@
 #include "Patcher.h"
 #include "Scanner.h"
 
-static bool _patchResult = false;
+#include <atomic>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 
-extern "C" __declspec(dllexport) bool PatchResult() { return _patchResult; }
+static std::atomic_bool _patchResult = false;
+
+extern "C" __declspec(dllexport) bool PatchResult() { return _patchResult.load(); }
 extern "C" __declspec(dllexport) void InitializeASI() { return; }
 
 #define CHECK_UE(name) exeName == (#name "-win64-shipping.exe") || exeName == (#name "-wingdk-shipping.exe")
 
-// Gears of War: E-Day (Xbox / GDK)
-// Exe is Themida protected, code is decrypted after the ASI is loaded,
-// so wait for it on a separate thread and patch once it is available
+// Gears of War: E-Day (Xbox / GDK). Packed code becomes available after ASI load.
+// Profile 0 preserves the full patch set; profile 1 exposes only DLSS for diagnosis.
+// This patch does not hook DRS, upscaler evaluation, or frame generation resources.
 static uintptr_t SafeGetAddress(HMODULE module, const char* pattern, ptrdiff_t offset, uintptr_t start = 0)
 {
     __try
@@ -27,81 +33,177 @@ static uintptr_t SafeGetAddress(HMODULE module, const char* pattern, ptrdiff_t o
     }
 }
 
-static void GoWEDayLog(const char* text, uintptr_t address)
+static void GoWEDayLog(const char* format, ...)
 {
     FILE* file = nullptr;
     if (_wfopen_s(&file, (Util::ExePath().parent_path() / L"OptiPatcher_goweday.log").c_str(), L"a") != 0 ||
         file == nullptr)
         return;
 
-    auto base = (uintptr_t) GetModuleHandle(nullptr);
-    fprintf(file, "[%lu] %s %s (rva 0x%llX)\n", GetTickCount(), text, address != 0 ? "OK" : "NOT FOUND",
-            address != 0 ? (unsigned long long) (address - base) : 0ULL);
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    fprintf(file, "[%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu tick=%llu] ", now.wYear, now.wMonth,
+            now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetCurrentProcessId(),
+            static_cast<unsigned long long>(GetTickCount64()));
+    va_list args;
+    va_start(args, format);
+    vfprintf(file, format, args);
+    va_end(args);
+    fputc('\n', file);
     fclose(file);
+}
+
+// Validate the complete ten-byte instruction, not just the wildcard pattern.
+static bool GoWEDayValidate(uintptr_t address, uintptr_t* vendorAddress)
+{
+    __try
+    {
+        const BYTE* code = reinterpret_cast<const BYTE*>(address);
+        if (code[0] != 0x81 || code[1] != 0x3D || code[6] != 0xDE || code[7] != 0x10 ||
+            code[8] != 0 || code[9] != 0)
+            return false;
+        int32_t displacement;
+        memcpy(&displacement, code + 2, sizeof(displacement));
+        *vendorAddress = address + 10 + static_cast<intptr_t>(displacement);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool GoWEDayWrite(uintptr_t address)
+{
+    const BYTE patch[] = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(address), sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect))
+    {
+        GoWEDayLog("WRITE FAILED error=%lu", GetLastError());
+        return false;
+    }
+
+    bool verified = false;
+    __try
+    {
+        memcpy(reinterpret_cast<void*>(address), patch, sizeof(patch));
+        verified = memcmp(reinterpret_cast<void*>(address), patch, sizeof(patch)) == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        GoWEDayLog("WRITE EXCEPTION");
+    }
+
+    DWORD unused = 0;
+    const BOOL restored = VirtualProtect(reinterpret_cast<void*>(address), sizeof(patch), oldProtect, &unused);
+    const DWORD restoreError = restored ? ERROR_SUCCESS : GetLastError();
+    const BOOL flushed = FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), sizeof(patch));
+    const DWORD flushError = flushed ? ERROR_SUCCESS : GetLastError();
+    GoWEDayLog("WRITE verified=%u protection_restored=%u restore_error=%lu cache_flushed=%u flush_error=%lu",
+                verified ? 1U : 0U, restored ? 1U : 0U, restoreError, flushed ? 1U : 0U, flushError);
+    return verified && restored && flushed;
 }
 
 static DWORD WINAPI GoWEDayGDKThread(LPVOID)
 {
-    auto exeModule = GetModuleHandle(nullptr);
-    std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-
-    // IsNvidia check before NGXRHI module load
-    const char* patternDLSS = "33 D2 E8 ? ? ? ? 81 3D ? ? ? ? DE 10 00 00 41 BF ? ? ? ? 74";
-    uintptr_t patchAddressDLSS = 0;
-
-    for (int i = 0; i < 24000 && patchAddressDLSS == 0; i++)
+    const auto config = Util::ExePath().parent_path() / L"OptiPatcher_goweday.ini";
+    const UINT profile = GetPrivateProfileIntW(L"Diagnostics", L"PatchProfile", 0, config.c_str());
+    GoWEDayLog("SESSION build=gdk-diag-v2 profile=%u (0=full, 1=DLSS-only) delayed PatchResult; OP title is not proof",
+                profile);
+    if (profile > 1)
     {
-        patchAddressDLSS = SafeGetAddress(exeModule, patternDLSS, 7);
-
-        if (patchAddressDLSS == 0)
-            Sleep(5);
+        GoWEDayLog("ABORT unsupported profile; no patches applied");
+        return 0;
     }
 
-    GoWEDayLog("DLSS check", patchAddressDLSS);
+    const char* names[] = { "DLSS", "SL[0]", "SL[1]", "FFX FG", "IsNvidia", "SL config" };
+    const char* patterns[] = {
+        "33 D2 E8 ? ? ? ? 81 3D ? ? ? ? DE 10 00 00 41 BF ? ? ? ? 74",
+        "75 1C 81 3D 98 AE 65 0D DE 10 00 00 74",
+        "75 1C 81 3D 62 BE 62 0B DE 10 00 00 74",
+        "E8 ? ? ? ? EB ? 81 3D ? ? ? ? DE 10 00 00 75",
+        "44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74",
+        "4C 8B ? 75 10 81 3D ? ? ? ? ? ? ? ? 0F"
+    };
+    const ptrdiff_t offsets[] = { 7, 2, 2, 7, 13, 5 };
+    const size_t count = profile == 1 ? 1 : 6;
+    const auto module = GetModuleHandle(nullptr);
+    const auto base = reinterpret_cast<uintptr_t>(module);
+    uintptr_t sites[6] = {};
+    const ULONGLONG begin = GetTickCount64();
+    bool ready = false;
 
-    if (patchAddressDLSS == 0)
-        return 0;
-
-    patcher::PatchAddress((void*) patchAddressDLSS, &patch);
-    _patchResult = true;
-
-    // SL checks
-    uintptr_t start = 0;
-    uintptr_t patchAddressSL = 0;
-    do
+    // Resolve the entire selected set before the first write; do not accept partial decryption.
+    while (GetTickCount64() - begin < 120000)
     {
-        patchAddressSL = SafeGetAddress(exeModule, "75 1C 81 3D ? ? ? ? ? ? ? ? 74", 2, start);
-        GoWEDayLog("SL check", patchAddressSL);
-
-        if (patchAddressSL != 0)
+        ready = true;
+        for (size_t i = 0; i < count; ++i)
         {
-            patcher::PatchAddress((void*) patchAddressSL, &patch);
-            start = patchAddressSL;
+            sites[i] = SafeGetAddress(module, patterns[i], offsets[i]);
+            if (sites[i] == 0)
+            {
+                ready = false;
+                break;
+            }
         }
-    } while (patchAddressSL != 0);
+        if (ready)
+            break;
+        Sleep(100);
+    }
 
-    // IsNvidia check above 2nd L"FFXFrameInterpolation"
-    auto patchAddressFFX = SafeGetAddress(exeModule, "E8 ? ? ? ? EB ? 81 3D ? ? ? ? DE 10 00 00 75", 7);
-    GoWEDayLog("FFX FG check", patchAddressFFX);
+    if (!ready)
+    {
+        GoWEDayLog("ABORT timeout after %llu ms; no patches applied", GetTickCount64() - begin);
+        for (size_t i = 0; i < count; ++i)
+            GoWEDayLog("SCAN %s rva=0x%llX", names[i], sites[i] ? sites[i] - base : 0ULL);
+        return 0;
+    }
 
-    if (patchAddressFFX != 0)
-        patcher::PatchAddress((void*) patchAddressFFX, &patch);
+    uintptr_t expectedVendor = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        uintptr_t vendor = 0;
+        if (!GoWEDayValidate(sites[i], &vendor) || (i != 0 && vendor != expectedVendor))
+        {
+            GoWEDayLog("ABORT %s invalid instruction or inconsistent vendor target; no patches applied", names[i]);
+            return 0;
+        }
+        expectedVendor = vendor;
+        for (size_t j = 0; j < i; ++j)
+        {
+            if (sites[i] == sites[j])
+            {
+                GoWEDayLog("ABORT duplicate patch address; no patches applied");
+                return 0;
+            }
+        }
+        // SL signatures pin the two sites observed in the supported GDK build.
+        // The old broad SL signature also matches a third copy in the dump.
+        // A changed layout must fail closed instead of patching another copy.
+        if (SafeGetAddress(module, patterns[i], offsets[i], sites[i] + 10) != 0)
+        {
+            GoWEDayLog("ABORT %s ambiguous pattern; no patches applied", names[i]);
+            return 0;
+        }
+        GoWEDayLog("VALIDATED %s rva=0x%llX vendor_rva=0x%llX", names[i], sites[i] - base, vendor - base);
+    }
 
-    // Some IsNvidia check (redundant?)
-    auto patchAddress2 =
-        SafeGetAddress(exeModule, "44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74", 13);
-    GoWEDayLog("IsNvidia check", patchAddress2);
-
-    if (patchAddress2 != 0)
-        patcher::PatchAddress((void*) patchAddress2, &patch);
-
-    // New SL config check
-    auto patchAddressSLConfig = SafeGetAddress(exeModule, "4C 8B ? 75 10 81 3D ? ? ? ? ? ? ? ? 0F", 5);
-    GoWEDayLog("SL config check", patchAddressSLConfig);
-
-    if (patchAddressSLConfig != 0)
-        patcher::PatchAddress((void*) patchAddressSLConfig, &patch);
-
+    size_t applied = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        uintptr_t vendor = 0;
+        if (!GoWEDayValidate(sites[i], &vendor) || vendor != expectedVendor || !GoWEDayWrite(sites[i]))
+        {
+            GoWEDayLog("FAILED %s rva=0x%llX applied=%zu/%zu; restart required, not safe to retry in process",
+                        names[i], sites[i] - base, applied, count);
+            return 0;
+        }
+        ++applied;
+        GoWEDayLog("APPLIED %s rva=0x%llX", names[i], sites[i] - base);
+    }
+    _patchResult = true;
+    GoWEDayLog("COMPLETE applied=%zu/%zu elapsed_ms=%llu; DRS/FG and image quality require game testing",
+                applied, count, GetTickCount64() - begin);
     return 0;
 }
 
@@ -679,7 +781,11 @@ static void CheckForPatch()
     // Gears of War: E-Day (Xbox / GDK)
     else if (exeName == "goweday.exe")
     {
-        CreateThread(nullptr, 0, GoWEDayGDKThread, nullptr, 0, nullptr);
+        HANDLE thread = CreateThread(nullptr, 0, GoWEDayGDKThread, nullptr, 0, nullptr);
+        if (thread != nullptr)
+            CloseHandle(thread);
+        else
+            GoWEDayLog("ABORT CreateThread failed error=%lu", GetLastError());
     }
 
     // The Alters
