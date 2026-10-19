@@ -12,6 +12,121 @@ extern "C" __declspec(dllexport) void InitializeASI() { return; }
 
 #define CHECK_UE(name) exeName == (#name "-win64-shipping.exe") || exeName == (#name "-wingdk-shipping.exe")
 
+// --- Gears of War: E-Day diagnostics (temporary) ---
+#include <cstdio>
+#include <string>
+
+static const char* _diagPatterns[] = {
+    "33 D2 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74",
+    "75 1C 81 3D ? ? ? ? ? ? ? ? 74",
+    "89 3C 8A EB 72 81 3D ? ? ? ? ? ? ? ? 75",
+    "44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74",
+    "4C 8B E9 75 10 81 3D ? ? ? ? ? ? ? ? 0F",
+    "81 3D ? ? ? ? DE 10 00 00",
+};
+
+static bool IsGoWEDay()
+{
+    auto name = Util::ExePath().filename().string();
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    return name.find("goweday") != std::string::npos;
+}
+
+static void DiagLog(const char* stage)
+{
+    auto dir = Util::ExePath().parent_path();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, (dir / L"OptiPatcher_diag.txt").c_str(), L"a") != 0 || f == nullptr)
+        return;
+
+    auto exeModule = GetModuleHandle(nullptr);
+    auto base = (uintptr_t) exeModule;
+    auto dos = (IMAGE_DOS_HEADER*) base;
+    auto nt = (IMAGE_NT_HEADERS64*) (base + dos->e_lfanew);
+
+    fprintf(f, "=== %s (tick %lu) ===\n", stage, GetTickCount());
+    fprintf(f, "exe: %s\n", Util::ExePath().filename().string().c_str());
+    fprintf(f, "base: 0x%llX sizeOfImage: 0x%X patchResult: %d\n", (unsigned long long) base,
+            nt->OptionalHeader.SizeOfImage, _patchResult ? 1 : 0);
+
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        char name[9] = {};
+        memcpy(name, sec[i].Name, 8);
+        MEMORY_BASIC_INFORMATION mbi {};
+        VirtualQuery((void*) (base + sec[i].VirtualAddress), &mbi, sizeof(mbi));
+        fprintf(f, "section %-8s rva 0x%08X vsize 0x%08X chars 0x%08X protect 0x%X\n", name, sec[i].VirtualAddress,
+                sec[i].Misc.VirtualSize, sec[i].Characteristics, mbi.Protect);
+    }
+
+    for (auto pattern : _diagPatterns)
+    {
+        int count = 0;
+        uintptr_t start = 0;
+        uintptr_t first = 0;
+        while (count < 50)
+        {
+            auto hit = scanner::GetAddress(exeModule, pattern, 0, start);
+            if (hit == 0)
+                break;
+            if (count == 0)
+                first = hit;
+            count++;
+            start = hit + 1;
+        }
+        fprintf(f, "pattern [%s] hits %d first rva 0x%llX\n", pattern, count,
+                first ? (unsigned long long) (first - base) : 0ULL);
+    }
+
+    fclose(f);
+}
+
+static void DiagDump()
+{
+    auto exeModule = GetModuleHandle(nullptr);
+    auto base = (BYTE*) exeModule;
+    auto nt = (IMAGE_NT_HEADERS64*) (base + ((IMAGE_DOS_HEADER*) base)->e_lfanew);
+    SIZE_T size = nt->OptionalHeader.SizeOfImage;
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, (Util::ExePath().parent_path() / L"goweday_dump.bin").c_str(), L"wb") != 0 || f == nullptr)
+        return;
+
+    std::vector<BYTE> zeros(0x1000, 0);
+    SIZE_T offset = 0;
+    while (offset < size)
+    {
+        MEMORY_BASIC_INFORMATION mbi {};
+        if (VirtualQuery(base + offset, &mbi, sizeof(mbi)) == 0)
+            break;
+
+        SIZE_T regionEnd = ((BYTE*) mbi.BaseAddress - base) + mbi.RegionSize;
+        if (regionEnd > size)
+            regionEnd = size;
+
+        bool readable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+        while (offset < regionEnd)
+        {
+            SIZE_T chunk = (regionEnd - offset) < 0x1000 ? (regionEnd - offset) : 0x1000;
+            fwrite(readable ? base + offset : zeros.data(), 1, chunk, f);
+            offset += chunk;
+        }
+    }
+
+    fclose(f);
+}
+
+static DWORD WINAPI DiagThread(LPVOID)
+{
+    Sleep(20000);
+    DiagLog("after 20s");
+    DiagDump();
+    DiagLog("after dump");
+    return 0;
+}
+// --- end diagnostics ---
+
 static void CheckForPatch()
 {
     auto exeName = Util::ExePath().filename().string();
@@ -2747,7 +2862,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
+        if (IsGoWEDay())
+            DiagLog("load, before patch");
         CheckForPatch();
+        if (IsGoWEDay())
+        {
+            DiagLog("load, after patch");
+            CreateThread(nullptr, 0, DiagThread, nullptr, 0, nullptr);
+        }
         break;
 
     case DLL_THREAD_ATTACH:
