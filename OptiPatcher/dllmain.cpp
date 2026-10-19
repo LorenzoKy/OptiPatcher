@@ -570,7 +570,7 @@ static void CheckForPatch()
 
     // Gears of War: E-Day
     // inline patch
-    else if (exeName == "goweday-steam.exe")
+    else if (exeName == "goweday-steam.exe" || exeName == "goweday.exe")
     {
         std::string_view pattern("33 D2 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
         auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7);
@@ -2170,7 +2170,7 @@ static void CheckForPatch()
 
     // DLSSG, Gears of War: E-Day
     // inline patch
-    else if (exeName == "goweday-steam.exe")
+    else if (exeName == "goweday-steam.exe" || exeName == "goweday.exe")
     {
         // SL checks
         std::string_view pattern("75 1C 81 3D ? ? ? ? ? ? ? ? 74");
