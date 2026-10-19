@@ -12,6 +12,99 @@ extern "C" __declspec(dllexport) void InitializeASI() { return; }
 
 #define CHECK_UE(name) exeName == (#name "-win64-shipping.exe") || exeName == (#name "-wingdk-shipping.exe")
 
+// Gears of War: E-Day (Xbox / GDK)
+// Exe is Themida protected, code is decrypted after the ASI is loaded,
+// so wait for it on a separate thread and patch once it is available
+static uintptr_t SafeGetAddress(HMODULE module, const char* pattern, ptrdiff_t offset, uintptr_t start = 0)
+{
+    __try
+    {
+        return scanner::GetAddress(module, pattern, offset, start);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+static void GoWEDayLog(const char* text, uintptr_t address)
+{
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, (Util::ExePath().parent_path() / L"OptiPatcher_goweday.log").c_str(), L"a") != 0 ||
+        file == nullptr)
+        return;
+
+    auto base = (uintptr_t) GetModuleHandle(nullptr);
+    fprintf(file, "[%lu] %s %s (rva 0x%llX)\n", GetTickCount(), text, address != 0 ? "OK" : "NOT FOUND",
+            address != 0 ? (unsigned long long) (address - base) : 0ULL);
+    fclose(file);
+}
+
+static DWORD WINAPI GoWEDayGDKThread(LPVOID)
+{
+    auto exeModule = GetModuleHandle(nullptr);
+    std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+
+    // IsNvidia check before NGXRHI module load
+    const char* patternDLSS = "33 D2 E8 ? ? ? ? 81 3D ? ? ? ? DE 10 00 00 41 BF ? ? ? ? 74";
+    uintptr_t patchAddressDLSS = 0;
+
+    for (int i = 0; i < 24000 && patchAddressDLSS == 0; i++)
+    {
+        patchAddressDLSS = SafeGetAddress(exeModule, patternDLSS, 7);
+
+        if (patchAddressDLSS == 0)
+            Sleep(5);
+    }
+
+    GoWEDayLog("DLSS check", patchAddressDLSS);
+
+    if (patchAddressDLSS == 0)
+        return 0;
+
+    patcher::PatchAddress((void*) patchAddressDLSS, &patch);
+    _patchResult = true;
+
+    // SL checks
+    uintptr_t start = 0;
+    uintptr_t patchAddressSL = 0;
+    do
+    {
+        patchAddressSL = SafeGetAddress(exeModule, "75 1C 81 3D ? ? ? ? ? ? ? ? 74", 2, start);
+        GoWEDayLog("SL check", patchAddressSL);
+
+        if (patchAddressSL != 0)
+        {
+            patcher::PatchAddress((void*) patchAddressSL, &patch);
+            start = patchAddressSL;
+        }
+    } while (patchAddressSL != 0);
+
+    // IsNvidia check above 2nd L"FFXFrameInterpolation"
+    auto patchAddressFFX = SafeGetAddress(exeModule, "E8 ? ? ? ? EB ? 81 3D ? ? ? ? DE 10 00 00 75", 7);
+    GoWEDayLog("FFX FG check", patchAddressFFX);
+
+    if (patchAddressFFX != 0)
+        patcher::PatchAddress((void*) patchAddressFFX, &patch);
+
+    // Some IsNvidia check (redundant?)
+    auto patchAddress2 =
+        SafeGetAddress(exeModule, "44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74", 13);
+    GoWEDayLog("IsNvidia check", patchAddress2);
+
+    if (patchAddress2 != 0)
+        patcher::PatchAddress((void*) patchAddress2, &patch);
+
+    // New SL config check
+    auto patchAddressSLConfig = SafeGetAddress(exeModule, "4C 8B ? 75 10 81 3D ? ? ? ? ? ? ? ? 0F", 5);
+    GoWEDayLog("SL config check", patchAddressSLConfig);
+
+    if (patchAddressSLConfig != 0)
+        patcher::PatchAddress((void*) patchAddressSLConfig, &patch);
+
+    return 0;
+}
+
 static void CheckForPatch()
 {
     auto exeName = Util::ExePath().filename().string();
@@ -570,7 +663,7 @@ static void CheckForPatch()
 
     // Gears of War: E-Day
     // inline patch
-    else if (exeName == "goweday-steam.exe" || exeName == "goweday.exe")
+    else if (exeName == "goweday-steam.exe")
     {
         std::string_view pattern("33 D2 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
         auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7);
@@ -581,6 +674,12 @@ static void CheckForPatch()
             patcher::PatchAddress(patchAddress, &patch);
             _patchResult = true;
         }
+    }
+
+    // Gears of War: E-Day (Xbox / GDK)
+    else if (exeName == "goweday.exe")
+    {
+        CreateThread(nullptr, 0, GoWEDayGDKThread, nullptr, 0, nullptr);
     }
 
     // The Alters
@@ -2170,7 +2269,7 @@ static void CheckForPatch()
 
     // DLSSG, Gears of War: E-Day
     // inline patch
-    else if (exeName == "goweday-steam.exe" || exeName == "goweday.exe")
+    else if (exeName == "goweday-steam.exe")
     {
         // SL checks
         std::string_view pattern("75 1C 81 3D ? ? ? ? ? ? ? ? 74");
