@@ -1,0 +1,42 @@
+name: GoW E-Day DRS fix
+on:
+  workflow_dispatch:
+  push:
+    branches: [goweday-gdk]
+    paths:
+      - patches/goweday-drs.patch
+      - .github/workflows/goweday-drs.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patch-set
+      - uses: actions/checkout@v4
+        with:
+          repository: optiscaler/OptiScaler
+          ref: babf1d6c1450dba634dd2f39de00d87698ccbef4
+          submodules: true
+          path: optiscaler
+      - name: Apply focused DRS correction
+        working-directory: optiscaler
+        shell: pwsh
+        run: |
+          git apply --check ../patch-set/patches/goweday-drs.patch
+          git apply ../patch-set/patches/goweday-drs.patch
+          git diff --check
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build Release x64
+        working-directory: optiscaler
+        run: msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+      - name: Upload corrected DLL and source patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoWEDay-DRS-color-fix-v1
+          path: |
+            optiscaler/x64/Release/a/OptiScaler.dll
+            patch-set/patches/goweday-drs.patch
+          if-no-files-found: error
