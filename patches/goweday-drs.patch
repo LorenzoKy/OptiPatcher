@@ -1,8 +1,16 @@
 diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
-index 1f6cac6..9471b15 100644
+index 1f6cac6..c3c852a 100644
 --- a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
 +++ b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
-@@ -128,7 +128,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+@@ -5,6 +5,7 @@
+ #include "FFXFeature_Dx12.h"
+ #include <misc/DeferredRelease.h>
+ #include "MathUtils.h"
++#include <cmath>
+ 
+ using namespace OptiMath;
+ 
+@@ -128,7 +129,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
  
      LOG_DEBUG("Jitter Offset: {0}x{1}", params.jitterOffset.x, params.jitterOffset.y);
  
@@ -11,7 +19,7 @@ index 1f6cac6..9471b15 100644
      InParameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
      params.reset = (reset == 1);
  
-@@ -138,7 +138,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+@@ -138,7 +139,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
  
      params.commandList = InCommandList;
  
@@ -20,7 +28,7 @@ index 1f6cac6..9471b15 100644
      if (InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor) != NVSDK_NGX_Result_Success)
          InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &paramColor);
  
-@@ -161,6 +161,10 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+@@ -161,6 +162,10 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
          }
  
@@ -31,7 +39,7 @@ index 1f6cac6..9471b15 100644
          // WAR for FSR 4's autoexposure shader reading entire underlying resource
          // instead of what's specified by renderSize or color's FfxApiResourceDescription.
          // Only linear has this issue
-@@ -173,21 +177,33 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+@@ -173,21 +178,33 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
              const auto diffW = static_cast<int>(desc.Width) - static_cast<int>(params.renderSize.width);
              const auto diffH = static_cast<int>(desc.Height) - static_cast<int>(params.renderSize.height);
  
@@ -46,9 +54,7 @@ index 1f6cac6..9471b15 100644
 -            if (validW && validH && isPadded)
 +            if (_lastColorWidth != desc.Width || _lastColorHeight != desc.Height ||
 +                _lastRenderWidth != params.renderSize.width || _lastRenderHeight != params.renderSize.height)
-             {
--                static size_t count = 0;
--                const size_t index = count % 2;
++            {
 +                LOG_INFO("DRS_COLOR_FIX_v1 FSR={}.{}.{} color={}x{} render={}x{} crop={} reset={}",
 +                         Version().major, Version().minor, Version().patch, desc.Width, desc.Height,
 +                         params.renderSize.width, params.renderSize.height, validRect && isPadded, params.reset);
@@ -57,25 +63,27 @@ index 1f6cac6..9471b15 100644
 +                _lastRenderWidth = params.renderSize.width;
 +                _lastRenderHeight = params.renderSize.height;
 +            }
- 
--                CreateBufferResourceWithSize(Device, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
--                                             &smallerColor[index], params.renderSize.width, params.renderSize.height);
++
 +            // DRS may keep a full-resolution allocation with a much smaller valid
 +            // render rectangle. Autoexposure must not read the inactive texels.
 +            if (validRect && isPadded)
-+            {
+             {
+-                static size_t count = 0;
+-                const size_t index = count % 2;
 +                const size_t index = _frameCount % 2;
  
--                if (smallerColor[index])
+-                CreateBufferResourceWithSize(Device, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+-                                             &smallerColor[index], params.renderSize.width, params.renderSize.height);
 +                const bool created = CreateBufferResourceWithSize(
 +                    Device, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
 +                    &smallerColor[index], params.renderSize.width, params.renderSize.height);
-+
+ 
+-                if (smallerColor[index])
 +                if (created && smallerColor[index])
                  {
                      ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                      D3D12_RESOURCE_STATE_COPY_SOURCE);
-@@ -218,14 +234,22 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+@@ -218,14 +235,22 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
                      ResourceBarrier(InCommandList, smallerColor[index], D3D12_RESOURCE_STATE_COPY_DEST,
                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
  
@@ -102,11 +110,50 @@ index 1f6cac6..9471b15 100644
      }
      else
      {
+@@ -469,13 +494,32 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+             params.cameraFovAngleVertical = GetRadiansFromDeg(60);
+     }
+ 
+-    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
+-        InParameters->Get("FSR.frameTimeDelta", &params.frameTimeDelta) != NVSDK_NGX_Result_Success)
++    // Tick on EVERY evaluation. GetDeltaTime() only ticked on fallback frames,
++    // accumulating seconds of successful NGX timings before the next fallback.
++    const double evaluationTimeMs = Util::MillisecondsNow();
++    double measuredDeltaMs = _lastEvaluationTimeMs > 0.0 ? evaluationTimeMs - _lastEvaluationTimeMs : 1000.0 / 60.0;
++    _lastEvaluationTimeMs = evaluationTimeMs;
++    if (!std::isfinite(measuredDeltaMs) || measuredDeltaMs <= 0.0)
++        measuredDeltaMs = 1000.0 / 60.0;
++
++    bool hasFrameTime = Config::Instance()->FsrUseFsrInputValues.value_or_default() &&
++                        InParameters->Get("FSR.frameTimeDelta", &params.frameTimeDelta) == NVSDK_NGX_Result_Success;
++    if (!hasFrameTime)
++        hasFrameTime = InParameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &params.frameTimeDelta) ==
++                       NVSDK_NGX_Result_Success;
++    const bool fallbackTime = !hasFrameTime || !std::isfinite(params.frameTimeDelta) || params.frameTimeDelta < 1.0f;
++    if (fallbackTime)
+     {
+-        if (InParameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &params.frameTimeDelta) !=
+-                NVSDK_NGX_Result_Success ||
+-            params.frameTimeDelta < 1.0f)
+-            params.frameTimeDelta = (float) GetDeltaTime();
++        // An actual long evaluation gap is a temporal discontinuity, not one
++        // enormous integration step for autoexposure/history.
++        if (measuredDeltaMs > 1000.0)
++        {
++            params.reset = true;
++            measuredDeltaMs = 1000.0 / 60.0;
++        }
++        params.frameTimeDelta = static_cast<float>(measuredDeltaMs);
++        LOG_DEBUG("DRS_FRAME_TIME_FIX_v1 measured_ms={} selected_ms={} reset={}",
++                  measuredDeltaMs, params.frameTimeDelta, params.reset);
+     }
+ 
+     LOG_DEBUG("FrameTimeDeltaInMsec: {0}", params.frameTimeDelta);
 diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.h b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.h
-index 885085b..4ba0d3e 100644
+index 885085b..be3554b 100644
 --- a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.h
 +++ b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.h
-@@ -9,6 +9,10 @@ class FFXFeatureDx12 : public FFXFeature, public IFeature_Dx12
+@@ -9,6 +9,11 @@ class FFXFeatureDx12 : public FFXFeature, public IFeature_Dx12
  {
    private:
      ID3D12Resource* smallerColor[2] {};
@@ -114,6 +161,7 @@ index 885085b..4ba0d3e 100644
 +    UINT _lastColorHeight = 0;
 +    UINT _lastRenderWidth = 0;
 +    UINT _lastRenderHeight = 0;
++    double _lastEvaluationTimeMs = 0.0;
  
      NVSDK_NGX_Parameter* SetParameters(NVSDK_NGX_Parameter* InParameters);
  
